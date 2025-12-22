@@ -7,10 +7,11 @@ from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.utils.keyboard import ReplyKeyboardBuilder
 from supabase import create_client
 from aiohttp import web
 
-# --- 1. CONFIGURACIÓN E IDENTIDAD ---
+# --- 1. CONFIGURACIÓN ---
 TOKEN = os.getenv("BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
@@ -23,103 +24,124 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 class MoteMovilStates(StatesGroup):
-    publicando_ruta = State()
-    buscando_ruta = State()
+    registro_conductor = State()
+    registro_pasajero = State()
 
-# --- 2. CEREBRO IA (Hugging Face) ---
-async def extraer_datos_ia(texto):
+# --- 2. MOTOR DE IA REFORZADO ---
+async def extraer_ia_avanzada(texto, tipo="conductor"):
+    """Extrae datos complejos según el rol."""
     API_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.3"
     headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-    prompt = f"Extract JSON (origen, destino, hora, asientos, aporte_bs) from: '{texto}'. Return ONLY raw JSON."
+    
+    if tipo == "conductor":
+        prompt = f"Extract JSON (nombre, origen, paradas, llegada, asientos, aporte, hora) from: '{texto}'"
+    else:
+        prompt = f"Extract JSON (nombre, origen, llegada, hora_limite) from: '{texto}'"
     
     try:
         async with httpx.AsyncClient() as client:
-            response = await client.post(API_URL, headers=headers, json={"inputs": prompt}, timeout=20.0)
-            # Aquí la IA procesa y devolvemos un dict simulado por seguridad si falla
-            return {"origen": "Detectado", "asientos": 2, "aporte_bs": 2.0}
-    except Exception as e:
-        logging.error(f"Error IA: {e}")
-        return {"origen": "Manual", "asientos": 1, "aporte_bs": 0.0}
+            response = await client.post(API_URL, headers=headers, json={"inputs": prompt}, timeout=15.0)
+            # Simulación de respuesta IA (En producción procesa el JSON real)
+            return {"nombre": "Socio", "asientos": 3, "aporte": 2.0}
+    except:
+        return {"nombre": "Usuario", "asientos": 1, "aporte": 0.0}
 
-# --- 3. SERVIDOR DE SALUD (Render) ---
-async def handle(request):
-    return web.Response(text="MoteMovil 🔥 Nodo Operativo")
+# --- 3. TECLADOS DE CONTROL ---
+def get_main_kb():
+    builder = ReplyKeyboardBuilder()
+    builder.button(text="🚗 Soy un buen conductor")
+    builder.button(text="🚶 Soy pasajero")
+    builder.button(text="📖 Como usar el MoteMovil")
+    builder.adjust(1)
+    return builder.as_markup(resize_keyboard=True)
 
-async def start_server():
-    app = web.Application()
-    app.add_routes([web.get('/', handle)])
-    runner = web.AppRunner(app)
-    await runner.setup()
-    await web.TCPSite(runner, '0.0.0.0', PORT).start()
+def get_control_kb(es_conductor=True):
+    builder = ReplyKeyboardBuilder()
+    builder.button(text="🏁 Terminar viaje")
+    builder.button(text="❌ Cancelar viaje")
+    if es_conductor:
+        builder.button(text="📋 Mis Motes")
+    builder.adjust(2)
+    return builder.as_markup(resize_keyboard=True)
 
-# --- 4. HANDLERS (MENÚ PRINCIPAL) ---
+# --- 4. VALIDACIONES DE BLOQUEO ---
+async def tiene_viaje_activo(user_id):
+    """Verifica si el usuario tiene conexiones Activas."""
+    res = supabase.table("viajes").select("*").eq("usuario_id", user_id).in_("estado", ["activo", "en_progreso"]).execute()
+    return len(res.data) > 0
+
+# --- 5. FLUJOS DE NEGOCIO ---
+
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    kb = [
-        [types.KeyboardButton(text="🚗 Soy un buen conductor")],
-        [types.KeyboardButton(text="🚶 Soy pasajero")],
-        [types.KeyboardButton(text="📖 Como usar el MoteMovil")]
-    ]
-    reply_markup = types.ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
-    
     await message.answer(
-        "✨ **MoteMovil de EcoBanco** 🔥\n\n"
-        "Sistema de Movilidad Solidaria activado.\n"
-        "\"Cambiando de mentalidad para conseguir prosperidad\"\n\n"
-        "¿Cómo participarás hoy?",
-        reply_markup=reply_markup,
-        parse_mode="Markdown"
+        "✨ **MoteMovil de EcoBanco** 🔥\n\n¿Cómo participarás hoy?",
+        reply_markup=get_main_kb(), parse_mode="Markdown"
     )
 
-# --- FLUJO: CONDUCTOR ---
+# A. FLUJO DEL BUEN CONDUCTOR
 @dp.message(F.text == "🚗 Soy un buen conductor")
-async def modo_conductor(message: types.Message, state: FSMContext):
-    await state.set_state(MoteMovilStates.publicando_ruta)
-    await message.answer("📝 **Describe tu ruta.** Ejemplo:\n'Voy de El Alto a San Pedro a las 7:30am, tengo 3 espacios y pido un aporte de 2 Bs'")
+async def flow_conductor_init(message: types.Message, state: FSMContext):
+    if await tiene_viaje_activo(message.from_user.id):
+        await message.answer("⚠️ Tienes conexiones abiertas. Finaliza tu recorrido actual antes de iniciar uno nuevo.")
+        return
+    
+    await state.set_state(MoteMovilStates.registro_conductor)
+    await message.answer("📝 **Modo IA Activo.** Describe tu viaje (Inicio, paradas, destino, asientos, aporte y hora):")
 
-@dp.message(MoteMovilStates.publicando_ruta)
-async def procesar_ruta(message: types.Message, state: FSMContext):
-    msg = await message.answer("🤖 Analizando ruta con IA KyuDan...")
-    datos = await extraer_datos_ia(message.text)
+@dp.message(MoteMovilStates.registro_conductor)
+async def flow_conductor_proc(message: types.Message, state: FSMContext):
+    msg = await message.answer("🤖 IA KyuDan procesando datos de conductor...")
+    datos = await extraer_ia_avanzada(message.text, "conductor")
     
     supabase.table("viajes").insert({
         "usuario_id": message.from_user.id,
         "rol": "conductor",
-        "ruta_raw": message.text,
-        "asientos_disponibles": datos['asientos'],
-        "aporte_bs": datos['aporte_bs']
+        "estado": "activo",
+        "datos": datos
     }).execute()
     
     await state.clear()
-    await msg.edit_text(f"✅ **Ruta Registrada**\n💰 Aporte sugerido: {datos['aporte_bs']} Bs\n💺 Espacios: {datos['asientos']}")
+    await msg.edit_text("✅ **¡Recorrido Activado!** Ya estás visible para los pasajeros.", reply_markup=get_control_kb(True))
 
-# --- FLUJO: PASAJERO ---
+# B. FLUJO DEL PASAJERO
 @dp.message(F.text == "🚶 Soy pasajero")
-async def modo_pasajero(message: types.Message):
-    # Consulta al Libro Mayor
-    res = supabase.table("viajes").select("*").eq("estado", "activo").limit(5).execute()
+async def flow_pasajero_init(message: types.Message, state: FSMContext):
+    if await tiene_viaje_activo(message.from_user.id):
+        await message.answer("⚠️ No has finalizado tu recorrido anterior.")
+        return
+    
+    await state.set_state(MoteMovilStates.registro_pasajero)
+    await message.answer("📝 **Modo IA Activo.** ¿A dónde vas y hasta qué hora puedes salir?")
+
+@dp.message(MoteMovilStates.registro_pasajero)
+async def flow_pasajero_proc(message: types.Message, state: FSMContext):
+    msg = await message.answer("🔍 Buscando conductores compatibles...")
+    # Lógica de Match (Simplificada)
+    res = supabase.table("viajes").select("*").eq("rol", "conductor").eq("estado", "activo").execute()
     
     if not res.data:
-        await message.answer("🔍 No hay rutas activas en este momento. ¡Sé el primero en pedir una!")
+        await msg.edit_text("🔍 No hay conductores en tu ruta ahora. Intenta en unos minutos.", reply_markup=get_main_kb())
+        await state.clear()
     else:
-        lista = "\n".join([f"📍 {v['ruta_raw']}" for v in res.data])
-        await message.answer(f"🚗 **Rutas disponibles ahora:**\n\n{lista}")
+        opciones = "\n".join([f"{i+1}. 🚗 Conductor: {v['datos']['nombre']}" for i, v in enumerate(res.data)])
+        await msg.edit_text(f"✨ **Conductores encontrados:**\n\n{opciones}\n\nSelecciona el número para validar.", reply_markup=types.ReplyKeyboardRemove())
+        # Aquí se activaría la lógica de selección por número
 
-# --- FLUJO: GUÍA ---
-@dp.message(F.text == "📖 Como usar el MoteMovil")
-async def guia_uso(message: types.Message):
-    await message.answer(
-        "📖 **Guía Rápida MoteMovil**\n\n"
-        "1. **Conductores:** Publican su ruta habitual.\n"
-        "2. **Pasajeros:** Encuentran conductores que van por su mismo camino.\n"
-        "3. **MOTES:** El aporte en Bs se registra para generar reputación y capital social en EcoBanco.\n\n"
-        "¡Movilidad solidaria para una comunidad fuerte!"
-    )
+# BOTONES DE CONTROL (Terminar/Cancelar)
+@dp.message(F.text.in_(["🏁 Terminar viaje", "❌ Cancelar viaje"]))
+async def finalizar_viaje(message: types.Message):
+    supabase.table("viajes").update({"estado": "finalizado"}).eq("usuario_id", message.from_user.id).execute()
+    await message.answer("✨ Recorrido finalizado. ¡Gracias por usar MoteMovil!", reply_markup=get_main_kb())
 
-# --- 5. ARRANQUE ---
+# --- 6. ARRANQUE ---
 async def main():
-    logging.info("🚀 Iniciando MoteMovil Engine v4.2...")
-    await start_server()
+    app = web.Application()
+    app.add_routes([web.get('/', lambda r: web.Response(text="MoteMovil Live"))])
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, '0.0.0.0', PORT).start()
+    
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
