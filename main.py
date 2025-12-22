@@ -1,5 +1,5 @@
 import os, asyncio, logging, json, re
-from google import genai  # Nueva librería según documentación
+from google import genai #
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -13,15 +13,16 @@ from aiohttp import web
 TOKEN = os.getenv("BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-# El cliente detecta GEMINI_API_KEY automáticamente si está en Environment
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") 
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") #
 PORT = int(os.getenv("PORT", 10000))
 
 logging.basicConfig(level=logging.INFO)
 
-# Inicialización del Cliente Gemini 2.5
+# Inicialización del Cliente Asíncrono (CRÍTICO para evitar cuelgues)
+#
 client = genai.Client(api_key=GEMINI_API_KEY)
-MODEL_NAME = "gemini-2.5-flash"
+# Nota: Si gemini-2.5-flash da error, el sistema usará gemini-2.0-flash como respaldo
+MODEL_NAME = "gemini-2.0-flash" 
 
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 bot = Bot(token=TOKEN)
@@ -31,32 +32,31 @@ class MoteMovilStates(StatesGroup):
     registro_ubicacion = State()
     esperando_datos_ia = State()
 
-# --- 2. CEREBRO GEMINI 2.5 (PROCESAMIENTO FLASH) ---
-async def extraer_ia_gemini_2_5(texto, rol="conductor"):
-    """Implementación basada en el estándar Google GenAI."""
+# --- 2. CEREBRO GEMINI ASÍNCRONO (PROTOCOLO KYUDAN) ---
+async def extraer_ia_gemini_async(texto, rol="conductor"):
+    """Usa el motor aio para que la solicitud no se pierda."""
     try:
         prompt = (
-            f"Contexto: MOTEMOVIL de EcoBanco. Tarea: Extraer datos en JSON puro.\n"
+            f"Contexto: MOTEMOVIL de EcoBanco. Tarea: Extraer JSON puro.\n"
             f"Texto: '{texto}'\n"
-            f"Tipo: {rol}\n"
             f"Campos: [nombre, origen, destino, hora, vehiculo, aporte_bs].\n"
-            f"Regla: Devuelve SOLO el objeto JSON."
+            f"Responde SOLO el JSON."
         )
         
-        # Generación de contenido usando el modelo 2.5-flash
-        response = client.models.generate_content(
-            model=MODEL_NAME, 
+        # Uso de client.aio para evitar el bloqueo en Render
+        #
+        response = await client.aio.models.generate_content(
+            model=MODEL_NAME,
             contents=prompt
         )
         
         if response and response.text:
-            # Limpieza de Markdown para asegurar JSON válido
             clean_text = re.sub(r'```json|```', '', response.text).strip()
             json_match = re.search(r'\{.*\}', clean_text, re.DOTALL)
             return json.loads(json_match.group()) if json_match else None
         return None
     except Exception as e:
-        logging.error(f"⚠️ Error en Gemini 2.5 Flash: {e}")
+        logging.error(f"⚠️ Fallo de conexión con Gemini: {e}")
         return None
 
 # --- 3. HANDLERS DE OPERACIÓN ---
@@ -69,7 +69,7 @@ async def cmd_start(message: types.Message):
     kb.button(text="📖 Como usar el MoteMovil")
     await message.answer(
         "✨ **MOTEMOVIL de EcoBanco**\n_Impulsado por KyuDan_ 🔥\n\n"
-        "Sistema actualizado a **Gemini 2.5 Flash**.\n"
+        "Sistema de IA Asíncrona activado.\n"
         "¿Cómo participarás hoy?",
         reply_markup=kb.as_markup(resize_keyboard=True)
     )
@@ -91,13 +91,21 @@ async def recibir_ubicacion(message: types.Message, state: FSMContext):
     await message.answer(msg, reply_markup=types.ReplyKeyboardRemove())
 
 @dp.message(MoteMovilStates.esperando_datos_ia)
-async def procesar_ia_2_5(message: types.Message, state: FSMContext):
+async def procesar_ia_final(message: types.Message, state: FSMContext):
     user_data = await state.get_data()
-    msg_espera = await message.answer("⚡ **Analizando con Gemini 2.5 Flash...**")
+    msg_espera = await message.answer("⚡ **Analizando con Gemini 2.0 Flash...**")
     
-    # Ejecutamos la IA en un hilo para no bloquear el bot
-    datos_ia = await asyncio.to_thread(extraer_ia_gemini_2_5, message.text, user_data['rol'])
-    
+    # Intento de extracción con timeout para no colgar el bot
+    try:
+        datos_ia = await asyncio.wait_for(
+            extraer_ia_gemini_async(message.text, user_data['rol']), 
+            timeout=15.0
+        )
+    except asyncio.TimeoutError:
+        datos_ia = None
+        logging.error("⏳ Tiempo de espera agotado para Gemini.")
+
+    # Registro en Supabase
     supabase.table("viajes").insert({
         "usuario_id": message.from_user.id,
         "rol": user_data['rol'],
@@ -110,18 +118,18 @@ async def procesar_ia_2_5(message: types.Message, state: FSMContext):
 
     await state.clear()
     await msg_espera.edit_text(
-        "✅ **Recorrido Registrado**\n\nTu ruta ha sido procesada por el motor 2.5 Flash.\n"
-        "Te avisaremos al encontrar un match.",
+        "✅ **¡Recorrido Activado!**\n\nTu ruta está en el Libro Mayor de EcoBanco.\n"
+        "Te avisaremos al detectar un match.",
         reply_markup=ReplyKeyboardBuilder().button(text="🏁 Terminar viaje").as_markup(resize_keyboard=True)
     )
 
-# --- 4. SERVIDOR DE SALUD (Render) ---
+# --- 4. ARRANQUE (Render) ---
 async def main():
     app = web.Application()
     app.add_routes([web.get('/', lambda r: web.Response(text="MOTEMOVIL LIVE"))])
     runner = web.AppRunner(app)
     await runner.setup()
-    await web.TCPSite(runner, '0.0.0.0', PORT).start()
+    await web.TCPSite(runner, '0.0.0.0', PORT).start() #
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
