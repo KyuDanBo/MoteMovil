@@ -1,9 +1,9 @@
 import os, asyncio, logging, json, re
 from google import genai
 from aiogram import Bot, Dispatcher, types, F
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
 from supabase import create_client
 from aiohttp import web
@@ -19,100 +19,106 @@ KEY_PRO = os.getenv("GEMINI_API_KEY_PRO")
 KEY_FREE = os.getenv("GEMINI_API_KEY_FREE")
 
 logging.basicConfig(level=logging.INFO)
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-bot = Bot(token=TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
+logger = logging.getLogger(__name__)
 
-# --- 2. AUDITORÍA DE ARRANQUE (Ver en logs de Render) ---
-def inicializar_clientes():
-    clients = []
-    if KEY_PRO: 
-        clients.append(genai.Client(api_key=KEY_PRO))
-        logging.info("💎 Llave PRO detectada y cargada.")
-    if KEY_FREE: 
-        clients.append(genai.Client(api_key=KEY_FREE))
-        logging.info("🔋 Llave FREE detectada y cargada.")
-    
-    if not clients:
-        logging.error("❌ ERROR CRÍTICO: No se detectó ninguna API Key en Render.")
-    return clients
+# --- 2. INICIALIZACIÓN DE SERVICIOS ---
+try:
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    bot = Bot(token=TOKEN)
+    dp = Dispatcher(storage=MemoryStorage())
+    logger.info("✅ Servicios base (Bot/Supabase) listos.")
+except Exception as e:
+    logger.error(f"❌ Error al iniciar servicios base: {e}")
 
-clients = inicializar_clientes()
-current_index = 0
+# Inicialización de Clientes Gemini
+clients = []
+if KEY_PRO: clients.append(genai.Client(api_key=KEY_PRO))
+if KEY_FREE: clients.append(genai.Client(api_key=KEY_FREE))
+current_idx = 0
 
 class MoteMovilStates(StatesGroup):
     registro_ubicacion = State()
     esperando_datos_ia = State()
 
-# --- 3. CEREBRO CON ESCAPE DE SEGURIDAD (v6.4) ---
-async def extraer_ia_con_timeout(texto, rol):
-    """Fuerza una respuesta o libera el proceso en 10s."""
-    global current_index
-    if not clients: return None
-
+# --- 3. LOGICA DE IA (CON FALLBACK) ---
+async def extraer_ia(texto, rol):
+    global current_idx
+    if not clients:
+        return None
     try:
-        # Intentamos con el cliente actual
-        client = clients[current_index]
-        prompt = f"Extract JSON from: '{texto}'. Role: {rol}. Fields: [nombre, origen, destino, hora, vehiculo, aporte_bs]."
-        
-        # Timeout preventivo de 10 segundos para evitar el 'Analizando...' eterno
-        response = await asyncio.wait_for(
-            client.aio.models.generate_content(model="gemini-2.0-flash", contents=prompt),
-            timeout=10.0
+        client = clients[current_idx]
+        # Usamos 2.0-flash que es el más estable en 2025 para esta librería
+        response = await client.aio.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=f"Extrae JSON de transporte: {texto}. Rol: {rol}"
         )
-        
         if response and response.text:
-            clean_text = re.sub(r'```json|```', '', response.text).strip()
-            json_match = re.search(r'\{.*\}', clean_text, re.DOTALL)
+            json_match = re.search(r'\{.*\}', response.text, re.DOTALL)
             return json.loads(json_match.group()) if json_match else None
-            
-    except asyncio.TimeoutError:
-        logging.warning("⏳ Timeout: Gemini no respondió a tiempo. Saltando a modo manual.")
-        return None
     except Exception as e:
-        logging.error(f"⚠️ Error en IA: {e}")
-        # Rotación simple si falla
-        current_index = (current_index + 1) % len(clients)
-        return None
+        logger.warning(f"⚠️ Fallo en cliente IA #{current_idx}: {e}")
+        current_idx = (current_idx + 1) % len(clients)
+    return None
 
-# --- 4. HANDLER DE PROCESAMIENTO ---
+# --- 4. HANDLERS PRINCIPALES ---
+@dp.message(F.text == "/start")
+async def cmd_start(message: types.Message):
+    kb = ReplyKeyboardBuilder()
+    kb.button(text="🚗 Soy un buen conductor")
+    kb.button(text="🚶 Soy pasajero")
+    kb.button(text="📖 Como usar el MoteMovil")
+    await message.answer("✨ **MOTEMOVIL de EcoBanco**\n_Impulsado por KyuDan_ 🔥\n\n¿Cómo participarás hoy?", reply_markup=kb.as_markup(resize_keyboard=True))
+
+@dp.message(F.text.in_(["🚗 Soy un buen conductor", "🚶 Soy pasajero"]))
+async def rol_inicio(message: types.Message, state: FSMContext):
+    await state.update_data(rol="conductor" if "conductor" in message.text else "pasajero")
+    await state.set_state(MoteMovilStates.registro_ubicacion)
+    kb = ReplyKeyboardBuilder().button(text="📍 Compartir ubicación", request_location=True).as_markup(resize_keyboard=True)
+    await message.answer("📍 Comparte tu ubicación:", reply_markup=kb)
+
+@dp.message(MoteMovilStates.registro_ubicacion, F.location)
+async def location_receive(message: types.Message, state: FSMContext):
+    await state.update_data(lat=message.location.latitude, lon=message.location.longitude)
+    await state.set_state(MoteMovilStates.esperando_datos_ia)
+    data = await state.get_data()
+    prompt = "Describe tu ruta, hora y vehículo:" if data['rol'] == "conductor" else "¿A dónde vas y hasta qué hora?"
+    await message.answer(f"📝 {prompt}", reply_markup=types.ReplyKeyboardRemove())
+
 @dp.message(MoteMovilStates.esperando_datos_ia)
-async def procesar_registro(message: types.Message, state: FSMContext):
-    user_data = await state.get_data()
-    msg_espera = await message.answer("⚡ **Procesando con Nodo KyuDan...**")
+async def process_ia(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    msg = await message.answer("⚡ Procesando...")
     
-    # Si la IA no responde, datos_ia será None y pasamos a modo manual
-    datos_ia = await extraer_ia_con_timeout(message.text, user_data['rol'])
+    # Intento de IA
+    datos_ia = await extraer_ia(message.text, data['rol'])
     
-    try:
-        supabase.table("viajes").insert({
-            "usuario_id": message.from_user.id,
-            "rol": user_data['rol'],
-            "latitud": user_data['lat'],
-            "longitud": user_data['lon'],
-            "ruta_raw": message.text,
-            "datos_ia": datos_ia,
-            "estado": "activo"
-        }).execute()
-        
-        status = "✅ Ruta Activa (Inteligente)" if datos_ia else "✅ Ruta Activa (Manual)"
-        await msg_espera.edit_text(
-            f"{status}\n\nTu trayecto ya está en el Libro Mayor de EcoBanco.",
-            reply_markup=ReplyKeyboardBuilder().button(text="🏁 Terminar viaje").as_markup(resize_keyboard=True)
-        )
-    except Exception as e:
-        logging.error(f"❌ Fallo Supabase: {e}")
-        await msg_espera.edit_text("⚠️ Error técnico. Reintenta.")
-
+    # Registro en Supabase
+    supabase.table("viajes").insert({
+        "usuario_id": message.from_user.id, "rol": data['rol'],
+        "latitud": data['lat'], "longitud": data['lon'],
+        "ruta_raw": message.text, "datos_ia": datos_ia
+    }).execute()
+    
     await state.clear()
+    await msg.edit_text("✅ **¡Ruta Activa!**\n\nTu trayecto está registrado en el búnker.", 
+                        reply_markup=ReplyKeyboardBuilder().button(text="🏁 Terminar viaje").as_markup(resize_keyboard=True))
 
-# --- 5. ARRANQUE (Render) ---
+# --- 5. SERVIDOR DE SALUD (RENDER) ---
+async def handle(request):
+    return web.Response(text="MOTEMOVIL LIVE")
+
 async def main():
+    # Iniciamos el servidor web PRIMERO para que Render no mate el proceso
     app = web.Application()
-    app.add_routes([web.get('/', lambda r: web.Response(text="MOTEMOVIL LIVE"))])
+    app.add_routes([web.get('/', handle)])
     runner = web.AppRunner(app)
     await runner.setup()
-    await web.TCPSite(runner, '0.0.0.0', PORT).start() #
+    site = web.TCPSite(runner, '0.0.0.0', PORT)
+    await site.start()
+    logger.info(f"🌐 Servidor de salud iniciado en puerto {PORT}")
+
+    # Iniciamos el bot
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
