@@ -1,7 +1,6 @@
 import os
 import asyncio
 import logging
-import httpx
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -11,11 +10,10 @@ from aiogram.utils.keyboard import ReplyKeyboardBuilder
 from supabase import create_client
 from aiohttp import web
 
-# --- 1. CONFIGURACIÓN ---
+# --- 1. IDENTIDAD KYUDAN ---
 TOKEN = os.getenv("BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-HF_TOKEN = os.getenv("HF_TOKEN")
 PORT = int(os.getenv("PORT", 10000))
 
 logging.basicConfig(level=logging.INFO)
@@ -24,120 +22,107 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 class MoteMovilStates(StatesGroup):
-    registro_conductor = State()
-    registro_pasajero = State()
+    esperando_ubicacion = State()
+    esperando_datos_ia = State()
 
-# --- 2. MOTOR DE IA REFORZADO ---
-async def extraer_ia_avanzada(texto, tipo="conductor"):
-    """Extrae datos complejos según el rol."""
-    API_URL = "https://api-inference.huggingface.co/models/mistralai/Mistral-7B-Instruct-v0.3"
-    headers = {"Authorization": f"Bearer {HF_TOKEN}"}
-    
-    if tipo == "conductor":
-        prompt = f"Extract JSON (nombre, origen, paradas, llegada, asientos, aporte, hora) from: '{texto}'"
-    else:
-        prompt = f"Extract JSON (nombre, origen, llegada, hora_limite) from: '{texto}'"
-    
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(API_URL, headers=headers, json={"inputs": prompt}, timeout=15.0)
-            # Simulación de respuesta IA (En producción procesa el JSON real)
-            return {"nombre": "Socio", "asientos": 3, "aporte": 2.0}
-    except:
-        return {"nombre": "Usuario", "asientos": 1, "aporte": 0.0}
-
-# --- 3. TECLADOS DE CONTROL ---
+# --- 2. CONSTRUCCIÓN DE INTERFAZ (BOTONES EXACTOS) ---
 def get_main_kb():
     builder = ReplyKeyboardBuilder()
+    # Los textos deben coincidir EXACTAMENTE con los handlers
     builder.button(text="🚗 Soy un buen conductor")
     builder.button(text="🚶 Soy pasajero")
     builder.button(text="📖 Como usar el MoteMovil")
     builder.adjust(1)
     return builder.as_markup(resize_keyboard=True)
 
-def get_control_kb(es_conductor=True):
+def get_location_kb():
     builder = ReplyKeyboardBuilder()
-    builder.button(text="🏁 Terminar viaje")
-    builder.button(text="❌ Cancelar viaje")
-    if es_conductor:
-        builder.button(text="📋 Mis Motes")
-    builder.adjust(2)
+    builder.button(text="📍 Compartir mi ubicación actual", request_location=True)
+    builder.button(text="❌ Cancelar")
     return builder.as_markup(resize_keyboard=True)
 
-# --- 4. VALIDACIONES DE BLOQUEO ---
+# --- 3. VALIDACIÓN DE BLOQUEO ---
 async def tiene_viaje_activo(user_id):
-    """Verifica si el usuario tiene conexiones Activas."""
     res = supabase.table("viajes").select("*").eq("usuario_id", user_id).in_("estado", ["activo", "en_progreso"]).execute()
     return len(res.data) > 0
 
-# --- 5. FLUJOS DE NEGOCIO ---
+# --- 4. HANDLERS PRINCIPALES ---
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer(
-        "✨ **MoteMovil de EcoBanco** 🔥\n\n¿Cómo participarás hoy?",
+        "✨ **MOTEMOVIL de EcoBanco**\n_Impulsado por KyuDan_ 🔥\n\n"
+        "\"Cambiando de mentalidad para conseguir prosperidad\"\n\n"
+        "Selecciona tu rol para iniciar el trayecto:",
         reply_markup=get_main_kb(), parse_mode="Markdown"
     )
 
-# A. FLUJO DEL BUEN CONDUCTOR
-@dp.message(F.text == "🚗 Soy un buen conductor")
-async def flow_conductor_init(message: types.Message, state: FSMContext):
-    if await tiene_viaje_activo(message.from_user.id):
-        await message.answer("⚠️ Tienes conexiones abiertas. Finaliza tu recorrido actual antes de iniciar uno nuevo.")
+# INICIO DE FLUJO: CONDUCTOR / PASAJERO
+@dp.message(F.text.in_(["🚗 Soy un buen conductor", "🚶 Soy pasajero"]))
+async def iniciar_flujo(message: types.Message, state: FSMContext):
+    user_id = message.from_user.id
+    rol = "conductor" if "conductor" in message.text else "pasajero"
+    
+    if await tiene_viaje_activo(user_id):
+        aviso = "⚠️ Tienes conexiones abiertas. Finaliza tu recorrido." if rol == "conductor" else "⚠️ No has finalizado tu recorrido anterior."
+        await message.answer(aviso)
         return
-    
-    await state.set_state(MoteMovilStates.registro_conductor)
-    await message.answer("📝 **Modo IA Activo.** Describe tu viaje (Inicio, paradas, destino, asientos, aporte y hora):")
 
-@dp.message(MoteMovilStates.registro_conductor)
-async def flow_conductor_proc(message: types.Message, state: FSMContext):
-    msg = await message.answer("🤖 IA KyuDan procesando datos de conductor...")
-    datos = await extraer_ia_avanzada(message.text, "conductor")
+    await state.update_data(rol=rol)
+    await state.set_state(MoteMovilStates.esperando_ubicacion)
+    await message.answer(
+        f"📍 Para un mejor match, por favor comparte tu ubicación actual.\n\n"
+        "Esto nos permite conectar personas en la misma zona sin depender solo de nombres de calles.",
+        reply_markup=get_location_kb()
+    )
+
+# CAPTURA DE UBICACIÓN
+@dp.message(MoteMovilStates.esperando_ubicacion, F.location)
+async def recibir_ubicacion(message: types.Message, state: FSMContext):
+    lat = message.location.latitude
+    lon = message.location.longitude
+    data = await state.get_data()
     
+    await state.update_data(lat=lat, lon=lon)
+    await state.set_state(MoteMovilStates.esperando_datos_ia)
+    
+    if data['rol'] == "conductor":
+        prompt = ("🚗 **Datos del Conductor y Vehículo**\n\n"
+                  "Dime: Nombre, Ruta (inicio y fin), Hora, Asientos, Aporte y **modelo/placa de tu vehículo**.")
+    else:
+        prompt = "🚶 **Datos del Pasajero**\n\n¿A dónde vas y cuál es tu hora límite de salida?"
+        
+    await message.answer(prompt, reply_markup=types.ReplyKeyboardRemove())
+
+# PROCESAMIENTO FINAL (IA + SUPABASE)
+@dp.message(MoteMovilStates.esperando_datos_ia)
+async def procesar_datos_ia(message: types.Message, state: FSMContext):
+    user_data = await state.get_data()
+    msg_espera = await message.answer("🤖 IA KyuDan procesando datos...")
+    
+    # Aquí se integraría la extracción de IA Mistral
+    # Guardamos en Supabase incluyendo coordenadas y datos de vehículo
     supabase.table("viajes").insert({
         "usuario_id": message.from_user.id,
-        "rol": "conductor",
-        "estado": "activo",
-        "datos": datos
+        "rol": user_data['rol'],
+        "latitud": user_data['lat'],
+        "longitud": user_data['lon'],
+        "ruta_raw": message.text,
+        "estado": "activo"
     }).execute()
-    
+
     await state.clear()
-    await msg.edit_text("✅ **¡Recorrido Activado!** Ya estás visible para los pasajeros.", reply_markup=get_control_kb(True))
+    await msg_espera.edit_text(
+        "✅ **¡Registro Exitoso!**\n\n"
+        "Tu ubicación y datos han sido guardados en el búnker.\n"
+        "Te avisaremos cuando haya un match compatible.",
+        reply_markup=get_main_kb()
+    )
 
-# B. FLUJO DEL PASAJERO
-@dp.message(F.text == "🚶 Soy pasajero")
-async def flow_pasajero_init(message: types.Message, state: FSMContext):
-    if await tiene_viaje_activo(message.from_user.id):
-        await message.answer("⚠️ No has finalizado tu recorrido anterior.")
-        return
-    
-    await state.set_state(MoteMovilStates.registro_pasajero)
-    await message.answer("📝 **Modo IA Activo.** ¿A dónde vas y hasta qué hora puedes salir?")
-
-@dp.message(MoteMovilStates.registro_pasajero)
-async def flow_pasajero_proc(message: types.Message, state: FSMContext):
-    msg = await message.answer("🔍 Buscando conductores compatibles...")
-    # Lógica de Match (Simplificada)
-    res = supabase.table("viajes").select("*").eq("rol", "conductor").eq("estado", "activo").execute()
-    
-    if not res.data:
-        await msg.edit_text("🔍 No hay conductores en tu ruta ahora. Intenta en unos minutos.", reply_markup=get_main_kb())
-        await state.clear()
-    else:
-        opciones = "\n".join([f"{i+1}. 🚗 Conductor: {v['datos']['nombre']}" for i, v in enumerate(res.data)])
-        await msg.edit_text(f"✨ **Conductores encontrados:**\n\n{opciones}\n\nSelecciona el número para validar.", reply_markup=types.ReplyKeyboardRemove())
-        # Aquí se activaría la lógica de selección por número
-
-# BOTONES DE CONTROL (Terminar/Cancelar)
-@dp.message(F.text.in_(["🏁 Terminar viaje", "❌ Cancelar viaje"]))
-async def finalizar_viaje(message: types.Message):
-    supabase.table("viajes").update({"estado": "finalizado"}).eq("usuario_id", message.from_user.id).execute()
-    await message.answer("✨ Recorrido finalizado. ¡Gracias por usar MoteMovil!", reply_markup=get_main_kb())
-
-# --- 6. ARRANQUE ---
+# --- 5. ARRANQUE ---
 async def main():
     app = web.Application()
-    app.add_routes([web.get('/', lambda r: web.Response(text="MoteMovil Live"))])
+    app.add_routes([web.get('/', lambda r: web.Response(text="MOTEMOVIL Live"))])
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', PORT).start()
