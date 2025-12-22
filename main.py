@@ -7,16 +7,26 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from supabase import create_client
 from aiohttp import web
 
-# --- 1. CONFIGURACIÓN ---
+# --- 1. CONFIGURACIÓN CON DIAGNÓSTICO ---
 TOKEN = os.getenv("BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-PORT = int(os.getenv("PORT", 10000)) # Render asigna un puerto automáticamente
+PORT = int(os.getenv("PORT", 10000))
 
-logging.basicConfig(level=logging.INFO)
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-bot = Bot(token=TOKEN)
-dp = Dispatcher(storage=MemoryStorage())
+# Verificación preventiva
+if not SUPABASE_URL:
+    logging.error("❌ ERROR: SUPABASE_URL no detectada en Environment.")
+if not SUPABASE_KEY:
+    logging.error("❌ ERROR: SUPABASE_KEY no detectada en Environment.")
+if not TOKEN:
+    logging.error("❌ ERROR: BOT_TOKEN no detectada en Environment.")
+
+# Solo intentamos conectar si tenemos las llaves
+try:
+    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+    logging.info("✅ Conexión con Supabase establecida.")
+except Exception as e:
+    logging.error(f"❌ Fallo al inicializar Supabase: {e}")
 
 # --- 2. SERVIDOR DE SALUD (Para que Render sepa que el bot está vivo) ---
 async def handle(request):
