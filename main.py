@@ -7,30 +7,26 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from supabase import create_client
 from aiohttp import web
 
-# --- 1. CONFIGURACIÓN CON DIAGNÓSTICO ---
+# --- 1. CONFIGURACIÓN E IDENTIDAD ---
 TOKEN = os.getenv("BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 PORT = int(os.getenv("PORT", 10000))
 
-# Verificación preventiva
-if not SUPABASE_URL:
-    logging.error("❌ ERROR: SUPABASE_URL no detectada en Environment.")
-if not SUPABASE_KEY:
-    logging.error("❌ ERROR: SUPABASE_KEY no detectada en Environment.")
-if not TOKEN:
-    logging.error("❌ ERROR: BOT_TOKEN no detectada en Environment.")
+logging.basicConfig(level=logging.INFO)
 
-# Solo intentamos conectar si tenemos las llaves
-try:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    logging.info("✅ Conexión con Supabase establecida.")
-except Exception as e:
-    logging.error(f"❌ Fallo al inicializar Supabase: {e}")
+# --- 2. INICIALIZACIÓN DE OFICIALES (ORDEN CRÍTICO) ---
+# Primero el Libro Mayor
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# --- 2. SERVIDOR DE SALUD (Para que Render sepa que el bot está vivo) ---
+# Segundo el Bot y el Dispatcher (AQUÍ SE DEFINE 'dp')
+bot = Bot(token=TOKEN)
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
+
+# --- 3. SERVIDOR DE SALUD (Para Render) ---
 async def handle(request):
-    return web.Response(text="MoteMovil 🔥 Nodo Render Activo")
+    return web.Response(text="MoteMovil 🔥 Nodo Render Operativo")
 
 async def start_server():
     app = web.Application()
@@ -39,19 +35,27 @@ async def start_server():
     await runner.setup()
     site = web.TCPSite(runner, '0.0.0.0', PORT)
     await site.start()
+    logging.info(f"✅ Puerto {PORT} abierto para salud.")
 
-# --- 3. LÓGICA DE NEGOCIO ---
+# --- 4. LÓGICA DE NEGOCIO (MOTES Y RUTAS) ---
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
+    user_id = message.from_user.id
+    # Registro en el Libro Mayor
+    try:
+        supabase.table("perfiles").upsert({"user_id": user_id, "nombre": message.from_user.full_name}).execute()
+    except Exception as e:
+        logging.error(f"Error en registro: {e}")
+
     await message.answer(
         "✨ **MoteMovil de EcoBanco** 🔥\n\n"
-        "¡Sistema Operativo en Render!\n"
-        "La soberanía tecnológica ha sido restablecida sin bloqueos.\n\n"
-        "¿Qué misión realizaremos hoy?",
+        "¡Conexión de Soberanía Total en Render!\n\n"
+        "¿Cuál es tu misión hoy?",
         reply_markup=types.ReplyKeyboardMarkup(
-            keyboard=[[types.KeyboardButton(text="🚗 Publicar Ruta")], 
-                     [types.KeyboardButton(text="📋 Mi Billetera (MOTES)")]],
-            resize_keyboard=True
+            keyboard=[
+                [types.KeyboardButton(text="🚗 Publicar Ruta")],
+                [types.KeyboardButton(text="📋 Mi Billetera (MOTES)")]
+            ], resize_keyboard=True
         ), parse_mode="Markdown"
     )
 
@@ -59,13 +63,15 @@ async def cmd_start(message: types.Message):
 async def ver_motes(message: types.Message):
     res = supabase.table("perfiles").select("saldo_motes").eq("user_id", message.from_user.id).execute()
     saldo = res.data[0]['saldo_motes'] if res.data else 0
-    await message.answer(f"💼 **Billetera EcoBanco**\nSaldo actual: **{saldo:.2f} MOTES**")
+    await message.answer(f"💼 **Billetera EcoBanco**\n\nSaldo actual: **{saldo:.2f} MOTES**")
 
-# --- 4. ARRANQUE ---
+# --- 5. ARRANQUE DEL MOTOR ---
 async def main():
-    logging.info("🚀 Iniciando MoteMovil en Render...")
+    logging.info("🚀 Iniciando MoteMovil Engine v4.1...")
     await start_server()
+    # Limpiar webhooks antiguos de GAS o Hugging Face
     await bot.delete_webhook(drop_pending_updates=True)
+    # Empezar a escuchar
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
