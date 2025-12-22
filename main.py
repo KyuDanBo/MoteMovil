@@ -1,10 +1,9 @@
-import os, asyncio, logging, json, re
-from google import genai
-from google.api_core import exceptions # Crítico para capturar el 429
+import os, asyncio, logging, math
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.utils.keyboard import ReplyKeyboardBuilder
 from supabase import create_client
 from aiohttp import web
@@ -15,110 +14,141 @@ SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
 PORT = int(os.getenv("PORT", 10000))
 
-# LLAVES DE GEMINI
-KEY_PRO = os.getenv("GEMINI_API_KEY_PRO")
-KEY_FREE = os.getenv("GEMINI_API_KEY_FREE")
-
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# --- 2. INICIALIZACIÓN DE CLIENTES ---
 supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
-# Lista de clientes configurados
-clients = []
-if KEY_PRO: clients.append({"name": "PRO", "client": genai.Client(api_key=KEY_PRO)})
-if KEY_FREE: clients.append({"name": "FREE", "client": genai.Client(api_key=KEY_FREE)})
+# --- 2. ESTADOS DEL CUESTIONARIO (FSM) ---
+class FormConductor(StatesGroup):
+    ubicacion = State()
+    nombre = State()
+    ruta_puntos = State() # Origen -> Paradas -> Destino
+    asientos = State()
+    aporte = State()
+    hora = State()
+    vehiculo = State()
 
-class MoteMovilStates(StatesGroup):
-    registro_ubicacion = State()
-    esperando_datos_ia = State()
+class FormPasajero(StatesGroup):
+    ubicacion = State()
+    nombre = State()
+    destino = State()
+    hora_limite = State()
 
-# --- 3. CEREBRO CON FALLOVER INMEDIATO (v6.6) ---
-async def extraer_ia_resiliente(texto, rol):
-    """Prueba todas las llaves disponibles antes de rendirse."""
-    if not clients:
-        logger.error("❌ No hay llaves configuradas.")
-        return None
+# --- 3. FUNCIONES DE APOYO ---
+def calcular_distancia(lat1, lon1, lat2, lon2):
+    R = 6371000
+    phi1, phi2 = math.radians(lat1), math.radians(lat2)
+    dphi, dlambda = math.radians(lat2-lat1), math.radians(lon2-lon1)
+    a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
+    return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
-    # Intentamos con cada cliente en la lista
-    for entry in clients:
-        name = entry["name"]
-        c = entry["client"]
-        
-        try:
-            logger.info(f"🛰️ Intentando con llave {name}...")
-            # Timeout de 8 segundos por intento para no colgar al usuario
-            response = await asyncio.wait_for(
-                c.aio.models.generate_content(
-                    model="gemini-2.0-flash",
-                    contents=f"Extract JSON from: {texto}. Role: {rol}. Fields: [nombre, origen, destino, hora, vehiculo, aporte_bs]. Respond ONLY JSON."
-                ),
-                timeout=8.0
-            )
-            
-            if response and response.text:
-                json_match = re.search(r'\{.*\}', response.text, re.DOTALL)
-                if json_match:
-                    logger.info(f"✅ Éxito con llave {name}")
-                    return json.loads(json_match.group())
-                    
-        except exceptions.ResourceExhausted:
-            logger.warning(f"⚠️ Llave {name} saturada (429). Saltando a la siguiente...")
-            continue # Pasa al siguiente cliente en el bucle 'for'
-        except Exception as e:
-            logger.error(f"⚠️ Error con llave {name}: {e}")
-            continue
-            
-    logger.error("❌ Todas las llaves fallaron o están saturadas.")
-    return None
+def get_main_kb():
+    builder = ReplyKeyboardBuilder()
+    builder.button(text="🚗 Soy un buen conductor")
+    builder.button(text="🚶 Soy pasajero")
+    builder.button(text="📖 Como usar el MoteMovil")
+    builder.adjust(1)
+    return builder.as_markup(resize_keyboard=True)
 
-# --- 4. HANDLERS ---
+# --- 4. FLUJO DE INICIO ---
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    kb = ReplyKeyboardBuilder()
-    kb.button(text="🚗 Soy un buen conductor")
-    kb.button(text="🚶 Soy pasajero")
-    kb.button(text="📖 Como usar el MoteMovil")
-    await message.answer("✨ **MOTEMOVIL de EcoBanco**\n_Impulsado por KyuDan_ 🔥", reply_markup=kb.as_markup(resize_keyboard=True))
+    await message.answer(
+        "✨ **MOTEMOVIL de EcoBanco**\n_Impulsado por KyuDan_ 🔥\n\n"
+        "Sistema de movilidad solidaria activado e instantáneo.\n"
+        "¿Cómo participarás hoy?", reply_markup=get_main_kb())
 
-@dp.message(F.text.in_(["🚗 Soy un buen conductor", "🚶 Soy pasajero"]))
-async def flow_init(message: types.Message, state: FSMContext):
-    await state.update_data(rol="conductor" if "conductor" in message.text else "pasajero")
-    await state.set_state(MoteMovilStates.registro_ubicacion)
-    kb = ReplyKeyboardBuilder().button(text="📍 Compartir ubicación", request_location=True).as_markup(resize_keyboard=True)
-    await message.answer("📍 Comparte tu ubicación:", reply_markup=kb)
+# --- 5. FLUJO SECUENCIAL: CONDUCTOR ---
+@dp.message(F.text == "🚗 Soy un buen conductor")
+async def cond_step1(message: types.Message, state: FSMContext):
+    await state.set_state(FormConductor.ubicacion)
+    kb = ReplyKeyboardBuilder().button(text="📍 Compartir ubicación actual", request_location=True).as_markup(resize_keyboard=True)
+    await message.answer("📍 Para iniciar, comparte tu ubicación actual:", reply_markup=kb)
 
-@dp.message(MoteMovilStates.registro_ubicacion, F.location)
-async def location_rcv(message: types.Message, state: FSMContext):
+@dp.message(FormConductor.ubicacion, F.location)
+async def cond_step2(message: types.Message, state: FSMContext):
     await state.update_data(lat=message.location.latitude, lon=message.location.longitude)
-    await state.set_state(MoteMovilStates.esperando_datos_ia)
-    data = await state.get_data()
-    prompt = "Describe ruta, hora y vehículo:" if data['rol'] == "conductor" else "¿A dónde vas y hora?"
-    await message.answer(f"📝 {prompt}", reply_markup=types.ReplyKeyboardRemove())
+    await state.set_state(FormConductor.nombre)
+    await message.answer("📝 ¿Cuál es tu nombre?", reply_markup=types.ReplyKeyboardRemove())
 
-@dp.message(MoteMovilStates.esperando_datos_ia)
-async def final_proc(message: types.Message, state: FSMContext):
+@dp.message(FormConductor.nombre)
+async def cond_step3(message: types.Message, state: FSMContext):
+    await state.update_data(nombre=message.text)
+    await state.set_state(FormConductor.ruta_puntos)
+    await message.answer("🛣️ Describe tu ruta (Ej: Ceja - Ballivian - Rio Seco):")
+
+@dp.message(FormConductor.ruta_puntos)
+async def cond_step4(message: types.Message, state: FSMContext):
+    await state.update_data(ruta=message.text)
+    await state.set_state(FormConductor.asientos)
+    await message.answer("💺 ¿Cuántos asientos tienes disponibles?")
+
+@dp.message(FormConductor.asientos)
+async def cond_step5(message: types.Message, state: FSMContext):
+    await state.update_data(asientos=message.text)
+    await state.set_state(FormConductor.aporte)
+    await message.answer("💰 ¿Cuál es el aporte sugerido en Bs?")
+
+@dp.message(FormConductor.aporte)
+async def cond_step6(message: types.Message, state: FSMContext):
+    await state.update_data(aporte=message.text)
+    await state.set_state(FormConductor.hora)
+    await message.answer("⏰ ¿A qué hora sales? (Ej: 08:30)")
+
+@dp.message(FormConductor.hora)
+async def cond_step7(message: types.Message, state: FSMContext):
+    await state.update_data(hora=message.text)
+    await state.set_state(FormConductor.vehiculo)
+    await message.answer("🚘 Datos de tu vehículo (Modelo y Color):")
+
+@dp.message(FormConductor.vehiculo)
+async def cond_final(message: types.Message, state: FSMContext):
     data = await state.get_data()
-    msg = await message.answer("⚡ **Conectando con Nodo KyuDan...**")
-    
-    # El motor ahora agota todas las llaves antes de devolver None
-    datos_ia = await extraer_ia_resiliente(message.text, data['rol'])
-    
+    # Guardado estructurado en Supabase
     supabase.table("viajes").insert({
-        "usuario_id": message.from_user.id, "rol": data['rol'],
+        "usuario_id": message.from_user.id, "rol": "conductor",
         "latitud": data['lat'], "longitud": data['lon'],
-        "ruta_raw": message.text, "datos_ia": datos_ia
+        "ruta_raw": data['ruta'], "estado": "activo",
+        "detalles": {
+            "nombre": data['nombre'], "asientos": data['asientos'],
+            "aporte": data['aporte'], "hora": data['hora'], "vehiculo": message.text
+        }
     }).execute()
-    
     await state.clear()
-    res_text = "✅ **Ruta Activa**" if datos_ia else "✅ **Ruta Registrada (Modo Manual)**"
-    await msg.edit_text(f"{res_text}\n\nYa eres visible para otros socios.", 
-                        reply_markup=ReplyKeyboardBuilder().button(text="🏁 Terminar viaje").as_markup(resize_keyboard=True))
+    kb = ReplyKeyboardBuilder().button(text="🏁 Terminar viaje").as_markup(resize_keyboard=True)
+    await message.answer("✅ **¡Ruta publicada con éxito!**\nYa eres visible para los pasajeros cerca.", reply_markup=kb)
 
-# --- 5. ARRANQUE ---
+# --- 6. FLUJO SECUENCIAL: PASAJERO ---
+@dp.message(F.text == "🚶 Soy pasajero")
+async def pas_step1(message: types.Message, state: FSMContext):
+    await state.set_state(FormPasajero.ubicacion)
+    kb = ReplyKeyboardBuilder().button(text="📍 Compartir ubicación actual", request_location=True).as_markup(resize_keyboard=True)
+    await message.answer("📍 Comparte tu ubicación para buscar conductores:", reply_markup=kb)
+
+@dp.message(FormPasajero.ubicacion, F.location)
+async def pas_step2(message: types.Message, state: FSMContext):
+    lat, lon = message.location.latitude, message.location.longitude
+    await state.update_data(lat=lat, lon=lon)
+    
+    # Búsqueda inmediata de Match por cercanía (1km)
+    res = supabase.table("viajes").select("*").eq("rol", "conductor").eq("estado", "activo").execute()
+    matches = [c for c in res.data if calcular_distancia(lat, lon, c['latitud'], c['longitud']) <= 1000]
+    
+    if not matches:
+        await message.answer("🔍 No hay conductores a 1km de tu posición. Te avisaremos si alguien se conecta.", reply_markup=get_main_kb())
+        await state.clear()
+    else:
+        lista = "\n".join([f"🚗 {c['detalles']['nombre']} - {c['detalles']['hora']} - {c['detalles']['aporte']} Bs" for c in matches])
+        await message.answer(f"✨ **Conductores encontrados cerca:**\n\n{lista}\n\nEscribe tu destino para concretar el match:")
+        await state.set_state(FormPasajero.destino)
+
+@dp.message(FormPasajero.destino)
+async def pas_final(message: types.Message, state: FSMContext):
+    await message.answer("✅ **Solicitud registrada.**\nEstamos notificando a los conductores compatibles.", reply_markup=get_main_kb())
+    await state.clear()
+
+# --- 7. ARRANQUE ---
 async def main():
     app = web.Application()
     app.add_routes([web.get('/', lambda r: web.Response(text="MOTEMOVIL LIVE"))])
