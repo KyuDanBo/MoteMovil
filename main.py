@@ -13,10 +13,13 @@ from aiohttp import web
 TOKEN = os.getenv("BOT_TOKEN")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") # Nueva Llave Maestra
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 PORT = int(os.getenv("PORT", 10000))
 
-# Configuración de Google Gemini
+# Verificación de Seguridad Crítica
+if not GEMINI_API_KEY:
+    logging.error("❌ ERROR CRÍTICO: GEMINI_API_KEY no encontrada en Environment.")
+
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel('gemini-1.5-flash')
 
@@ -26,58 +29,51 @@ bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
 
 class MoteMovilStates(StatesGroup):
-    esperando_kyc = State()
     registro_ubicacion = State()
     esperando_datos_ia = State()
 
-# --- 2. CEREBRO GEMINI (EXTRACCIÓN DE PRECISIÓN) ---
+# --- 2. CEREBRO GEMINI (MODO ASÍNCRONO NATIVO) ---
 async def extraer_ia_gemini(texto, rol="conductor"):
-    """Usa Gemini para convertir lenguaje natural en datos para el Libro Mayor."""
+    """Versión optimizada para evitar bloqueos en Render."""
     try:
+        logging.info(f"📡 Enviando solicitud a Gemini para {rol}...")
         prompt = (
-            f"Actúa como el procesador de MOTEMOVIL. Extrae los siguientes datos en formato JSON puro "
-            f"del texto: '{texto}'. "
-            f"Si es conductor: [nombre, origen, destino, paradas, asientos, aporte_bs, vehiculo, hora]. "
-            f"Si es pasajero: [nombre, origen, destino, hora_limite]. "
-            f"IMPORTANTE: Devuelve SOLO el JSON, nada de texto extra."
+            f"Actúa como el motor de MOTEMOVIL. Extrae los datos en JSON puro de: '{texto}'. "
+            f"Campos para {rol}: [nombre, origen, destino, hora, vehiculo, aporte_bs]. "
+            f"Respuesta: SOLO el JSON, sin texto extra."
         )
-        response = await asyncio.to_thread(model.generate_content, prompt)
         
-        # Limpieza de la respuesta para obtener el JSON
-        raw_text = response.text
-        json_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
-        if json_match:
-            return json.loads(json_match.group())
-        return None
+        # Usamos la versión asíncrona nativa de Gemini
+        response = await model.generate_content_async(prompt)
+        
+        if not response or not response.text:
+            logging.warning("⚠️ Gemini no devolvió texto (posible bloqueo de seguridad o cuota).")
+            return None
+            
+        logging.info(f"📥 Respuesta de Gemini recibida con éxito.")
+        json_match = re.search(r'\{.*\}', response.text, re.DOTALL)
+        return json.loads(json_match.group()) if json_match else None
+
     except Exception as e:
-        logging.error(f"⚠️ Fallo Crítico Gemini: {e}")
+        logging.error(f"💥 Error en el motor Gemini: {e}")
         return None
 
-# --- 3. HANDLERS DE OPERACIÓN (ESTABLE) ---
+# --- 3. HANDLERS (FLUJO ESTABLE) ---
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
-    # Registro/Actualización de Perfil
-    supabase.table("perfiles").upsert({"user_id": message.from_user.id, "nombre": message.from_user.full_name}).execute()
-    
     kb = ReplyKeyboardBuilder()
     kb.button(text="🚗 Soy un buen conductor")
     kb.button(text="🚶 Soy pasajero")
     kb.button(text="📖 Como usar el MoteMovil")
-    await message.answer(
-        "✨ **MOTEMOVIL de EcoBanco**\n_Impulsado por KyuDan_ 🔥\n\n"
-        "Selecciona tu rol para iniciar el trayecto:",
-        reply_markup=kb.as_markup(resize_keyboard=True)
-    )
+    await message.answer("✨ **MOTEMOVIL de EcoBanco**\n_Impulsado por KyuDan_ 🔥\n\n¿Cómo participarás hoy?", reply_markup=kb.as_markup(resize_keyboard=True))
 
 @dp.message(F.text.in_(["🚗 Soy un buen conductor", "🚶 Soy pasajero"]))
 async def iniciar_flujo(message: types.Message, state: FSMContext):
-    rol = "conductor" if "conductor" in message.text else "pasajero"
-    await state.update_data(rol=rol)
+    await state.update_data(rol="conductor" if "conductor" in message.text else "pasajero")
     await state.set_state(MoteMovilStates.registro_ubicacion)
-    
     kb = ReplyKeyboardBuilder().button(text="📍 Compartir mi ubicación", request_location=True).as_markup(resize_keyboard=True)
-    await message.answer("📍 Para conectar con otros socios, comparte tu ubicación actual:", reply_markup=kb)
+    await message.answer("📍 Comparte tu ubicación para el match:", reply_markup=kb)
 
 @dp.message(MoteMovilStates.registro_ubicacion, F.location)
 async def recibir_ubicacion(message: types.Message, state: FSMContext):
@@ -85,21 +81,22 @@ async def recibir_ubicacion(message: types.Message, state: FSMContext):
     data = await state.get_data()
     await state.set_state(MoteMovilStates.esperando_datos_ia)
     
-    if data['rol'] == "conductor":
-        texto = "🚗 **Datos del Recorrido**\nDime: Nombre, Ruta, Hora, Asientos, Aporte y **datos de tu vehículo**."
-    else:
-        texto = "🚶 **Datos del Pasajero**\n¿A dónde vas y cuál es tu hora límite de salida?"
-    
-    await message.answer(texto, reply_markup=types.ReplyKeyboardRemove())
+    prompt = "🚗 Describe: Nombre, Ruta, Hora, Asientos, Aporte y datos del Vehículo." if data['rol'] == "conductor" else "🚶 ¿A dónde vas y cuál es tu hora límite?"
+    await message.answer(prompt, reply_markup=types.ReplyKeyboardRemove())
 
 @dp.message(MoteMovilStates.esperando_datos_ia)
 async def procesar_con_gemini(message: types.Message, state: FSMContext):
     user_data = await state.get_data()
-    msg_espera = await message.answer("⚡ **IA Gemini procesando...**")
+    msg_espera = await message.answer("⚡ **IA Gemini analizando tu ruta...**")
     
-    datos_ia = await extraer_ia_gemini(message.text, user_data['rol'])
-    
-    # Registro en Supabase
+    # Intento de extracción IA con timeout de seguridad
+    try:
+        datos_ia = await asyncio.wait_for(extraer_ia_gemini(message.text, user_data['rol']), timeout=15.0)
+    except asyncio.TimeoutError:
+        logging.error("⏳ Timeout: Gemini tardó demasiado.")
+        datos_ia = None
+
+    # Registro resiliente en Supabase
     supabase.table("viajes").insert({
         "usuario_id": message.from_user.id,
         "rol": user_data['rol'],
@@ -112,20 +109,19 @@ async def procesar_con_gemini(message: types.Message, state: FSMContext):
 
     await state.clear()
     await msg_espera.edit_text(
-        "✅ **¡Recorrido Activado en MOTEMOVIL!**\n\n"
-        "La IA ha registrado tu ruta con éxito.\n"
-        "Te avisaremos apenas encontremos un match compatible.",
+        "✅ **¡Recorrido Activado!**\n\n"
+        "Ya eres visible en el Libro Mayor de EcoBanco.\n"
+        "Te avisaremos apenas encontremos un match.",
         reply_markup=ReplyKeyboardBuilder().button(text="🏁 Terminar viaje").as_markup(resize_keyboard=True)
     )
 
-# --- 4. SERVIDOR DE SALUD (Render) ---
+# --- 4. ARRANQUE (Render) ---
 async def main():
     app = web.Application()
     app.add_routes([web.get('/', lambda r: web.Response(text="MOTEMOVIL LIVE"))])
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, '0.0.0.0', PORT).start()
-    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
