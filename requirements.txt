@@ -3,3 +3,4 @@ supabase==2.10.0
 httpx
 aiohttp
 dnspython
+google-generativeai
