@@ -1,6 +1,6 @@
 aiogram==3.15.0
 supabase==2.10.0
 httpx
+google-genai
 aiohttp
 dnspython
-google-generativeai
